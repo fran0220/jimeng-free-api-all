@@ -1,9 +1,15 @@
 import _ from 'lodash';
 
 import Request from '@/lib/request/Request.ts';
-import Response from '@/lib/response/Response.ts';
 import { tokenSplit } from '@/api/controllers/core.ts';
-import { generateVideo, generateSeedanceVideo, isSeedanceModel, DEFAULT_MODEL } from '@/api/controllers/videos.ts';
+import {
+    DEFAULT_MODEL,
+    generateSeedanceVideo,
+    generateVideo,
+    getVideoStatusByHistoryId,
+    isSeedanceModel,
+    submitSeedanceVideo,
+} from '@/api/controllers/videos.ts';
 import util from '@/lib/util.ts';
 
 export default {
@@ -130,6 +136,90 @@ export default {
             }
         }
 
+        ,
+
+        '/submit': async (request: Request) => {
+            const contentType = request.headers['content-type'] || '';
+            const isMultiPart = contentType.startsWith('multipart/form-data');
+
+            request
+                .validate('body.model', v => _.isUndefined(v) || _.isString(v))
+                .validate('body.prompt', v => _.isUndefined(v) || _.isString(v))
+                .validate('body.ratio', v => _.isUndefined(v) || _.isString(v))
+                .validate('body.resolution', v => _.isUndefined(v) || _.isString(v))
+                .validate('body.duration', v => {
+                    if (_.isUndefined(v)) return true;
+                    if (isMultiPart && typeof v === 'string') {
+                        const num = parseInt(v);
+                        return num >= 4 && num <= 15;
+                    }
+                    return _.isFinite(v) && v >= 4 && v <= 15;
+                })
+                .validate('body.file_paths', v => _.isUndefined(v) || _.isArray(v))
+                .validate('body.filePaths', v => _.isUndefined(v) || _.isArray(v))
+                .validate('headers.authorization', _.isString);
+
+            const tokens = tokenSplit(request.headers.authorization);
+            const token = _.sample(tokens);
+
+            const {
+                model = DEFAULT_MODEL,
+                prompt,
+                ratio = '4:3',
+                resolution = '720p',
+                duration = 4,
+                file_paths = [],
+                filePaths = [],
+            } = request.body;
+
+            const finalDuration = isMultiPart && typeof duration === 'string'
+                ? parseInt(duration)
+                : duration;
+
+            const finalFilePaths = filePaths.length > 0 ? filePaths : file_paths;
+
+            if (!isSeedanceModel(model)) {
+                throw new Error('submit 接口当前仅支持 Seedance 模型，请使用 jimeng-video-seedance-2.0 或 seedance-2.0');
+            }
+
+            const submitResult = await submitSeedanceVideo(
+                model,
+                prompt,
+                {
+                    ratio,
+                    resolution,
+                    duration: finalDuration,
+                    filePaths: finalFilePaths,
+                    files: request.files,
+                },
+                token
+            );
+
+            return {
+                code: 0,
+                message: 'submitted',
+                data: submitResult,
+            };
+        }
+
+    },
+
+    get: {
+        '/:id/status': async (request: Request) => {
+            request
+                .validate('params.id', _.isString)
+                .validate('headers.authorization', _.isString);
+
+            const tokens = tokenSplit(request.headers.authorization);
+            const token = _.sample(tokens);
+
+            const statusResult = await getVideoStatusByHistoryId(request.params.id, token);
+            return {
+                code: 0,
+                message: 'ok',
+                data: statusResult,
+            };
+        },
     }
 
 }

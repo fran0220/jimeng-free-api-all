@@ -1931,6 +1931,497 @@ export async function generateSeedanceVideo(
 }
 
 /**
+ * Seedance submit-only: 仅提交任务并返回 history_record_id，不做轮询。
+ */
+export async function submitSeedanceVideo(
+  _model: string,
+  prompt: string,
+  {
+    ratio = "4:3",
+    resolution = "720p",
+    duration = 4,
+    filePaths = [],
+    files = [],
+  }: {
+    ratio?: string;
+    resolution?: string;
+    duration?: number;
+    filePaths?: string[];
+    files?: any[];
+  },
+  refreshToken: string
+) {
+  const model = getModel(_model);
+  const benefitType = SEEDANCE_BENEFIT_TYPE_MAP[_model] || "dreamina_video_seedance_20_pro";
+  const actualDuration = duration || 4;
+  const { width, height } = resolveVideoResolution(resolution, ratio);
+
+  logger.info(`Seedance submit: 模型=${_model} 映射=${model} ${width}x${height} (${ratio}@${resolution}) 时长=${actualDuration}秒`);
+
+  const { totalCredit } = await getCredit(refreshToken);
+  if (totalCredit <= 0) {
+    await receiveCredit(refreshToken);
+  }
+
+  let uploadedMaterials: UploadedMaterial[] = [];
+
+  if (files && files.length > 0) {
+    logger.info(`Seedance submit: 开始处理 ${files.length} 个上传文件`);
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      if (!file || !file.filepath) {
+        logger.warn(`Seedance submit: 第 ${i + 1} 个文件无效，跳过`);
+        continue;
+      }
+
+      const materialType = detectMaterialType(file);
+      try {
+        logger.info(`Seedance submit: 开始上传第 ${i + 1} 个文件 (${materialType})`);
+        const buffer = fs.readFileSync(file.filepath);
+
+        if (materialType === "image") {
+          const imageUri = await uploadImageBufferForVideo(buffer, refreshToken);
+          if (imageUri) {
+            uploadedMaterials.push({ type: "image", uri: imageUri, width, height });
+          }
+        } else {
+          const vodResult = await uploadMediaForVideo(buffer, materialType, refreshToken, file.originalFilename);
+          uploadedMaterials.push({
+            type: materialType,
+            vid: vodResult.vid,
+            width: vodResult.width,
+            height: vodResult.height,
+            duration: vodResult.duration,
+            fps: vodResult.fps,
+            name: file.originalFilename || "",
+          });
+        }
+      } catch (error) {
+        logger.error(`Seedance submit: 第 ${i + 1} 个文件上传失败: ${error.message}`);
+        if (i === 0) {
+          throw new APIException(EX.API_REQUEST_FAILED, `首个文件上传失败: ${error.message}`);
+        }
+      }
+    }
+  } else if (filePaths && filePaths.length > 0) {
+    logger.info(`Seedance submit: 开始处理 ${filePaths.length} 个 URL 素材`);
+
+    for (let i = 0; i < filePaths.length; i++) {
+      const filePath = filePaths[i];
+      if (!filePath) continue;
+
+      const materialType = detectMaterialTypeFromUrl(filePath);
+      try {
+        if (materialType === "image") {
+          const imageUri = await uploadImageForVideo(filePath, refreshToken);
+          if (imageUri) {
+            uploadedMaterials.push({ type: "image", uri: imageUri, width, height });
+          }
+        } else {
+          const response = await fetch(filePath);
+          if (!response.ok) throw new Error(`下载文件失败: ${response.status}`);
+          const arrayBuffer = await response.arrayBuffer();
+          const buffer = Buffer.from(arrayBuffer);
+          const vodResult = await uploadMediaForVideo(buffer, materialType, refreshToken);
+          uploadedMaterials.push({
+            type: materialType,
+            vid: vodResult.vid,
+            width: vodResult.width,
+            height: vodResult.height,
+            duration: vodResult.duration,
+            fps: vodResult.fps,
+          });
+        }
+      } catch (error) {
+        logger.error(`Seedance submit: 第 ${i + 1} 个素材上传失败: ${error.message}`);
+        if (i === 0) {
+          throw new APIException(EX.API_REQUEST_FAILED, `首个素材上传失败: ${error.message}`);
+        }
+      }
+    }
+  }
+
+  if (uploadedMaterials.length === 0) {
+    throw new APIException(EX.API_REQUEST_FAILED, "Seedance 2.0 需要至少一个文件（图片/视频/音频）");
+  }
+
+  const materialList = uploadedMaterials.map((mat, idx) => {
+    const base = {
+      type: "",
+      id: util.uuid(),
+      common_attr: {
+        type: "",
+        id: util.uuid(),
+      },
+      order: idx,
+      source_from: "upload",
+      platform_type: 1,
+    };
+
+    if (mat.type === "image") {
+      return {
+        ...base,
+        material_type: "image",
+        image_info: {
+          type: "",
+          id: util.uuid(),
+          source_from: "upload",
+          name: "",
+          image_uri: mat.uri,
+          aigc_image: { type: "", id: util.uuid() },
+          width: mat.width,
+          height: mat.height,
+          format: "",
+          uri: mat.uri,
+        }
+      };
+    }
+
+    if (mat.type === "video") {
+      return {
+        ...base,
+        material_type: "video",
+        video_info: {
+          type: "video",
+          id: util.uuid(),
+          source_from: "upload",
+          name: mat.name || "",
+          vid: mat.vid,
+          fps: mat.fps || 0,
+          width: mat.width || 0,
+          height: mat.height || 0,
+          duration: mat.duration || 0,
+        }
+      };
+    }
+
+    return {
+      ...base,
+      material_type: "audio",
+      audio_info: {
+        type: "audio",
+        id: util.uuid(),
+        source_from: "upload",
+        vid: mat.vid,
+        duration: mat.duration || 0,
+        name: mat.name || "",
+      }
+    };
+  });
+
+  const metaList = buildMetaListFromPrompt(prompt, uploadedMaterials);
+  const componentId = util.uuid();
+  const submitId = util.uuid();
+  const draftVersion = MODEL_DRAFT_VERSIONS[_model] || "3.3.9";
+
+  const gcd = (a: number, b: number): number => b === 0 ? a : gcd(b, a % b);
+  const divisor = gcd(width, height);
+  const aspectRatio = `${width / divisor}:${height / divisor}`;
+
+  const metricsExtra = JSON.stringify({
+    isDefaultSeed: 1,
+    originSubmitId: submitId,
+    isRegenerate: false,
+    enterFrom: "click",
+    position: "page_bottom_box",
+    functionMode: "omni_reference",
+    sceneOptions: JSON.stringify([{
+      type: "video",
+      scene: "BasicVideoGenerateButton",
+      modelReqKey: model,
+      videoDuration: actualDuration,
+      reportParams: {
+        enterSource: "generate",
+        vipSource: "generate",
+        extraVipFunctionKey: model,
+        useVipFunctionDetailsReporterHoc: true
+      },
+      materialTypes: [...new Set(uploadedMaterials.map(m => MATERIAL_TYPE_CODE[m.type]))]
+    }])
+  });
+
+  const token = await acquireToken(refreshToken);
+  const generateQueryParams = new URLSearchParams({
+    aid: String(CORE_ASSISTANT_ID),
+    device_platform: "web",
+    region: "cn",
+    webId: String(WEB_ID),
+    da_version: draftVersion,
+    web_component_open_flag: "1",
+    web_version: "7.5.0",
+    aigc_features: "app_lip_sync",
+  });
+
+  const generateUrl = `https://jimeng.jianying.com/mweb/v1/aigc_draft/generate?${generateQueryParams.toString()}`;
+  const generateBody = {
+    extend: {
+      root_model: model,
+      m_video_commerce_info: {
+        benefit_type: benefitType,
+        resource_id: "generate_video",
+        resource_id_type: "str",
+        resource_sub_type: "aigc"
+      },
+      m_video_commerce_info_list: [{
+        benefit_type: benefitType,
+        resource_id: "generate_video",
+        resource_id_type: "str",
+        resource_sub_type: "aigc"
+      }]
+    },
+    submit_id: submitId,
+    metrics_extra: metricsExtra,
+    draft_content: JSON.stringify({
+      type: "draft",
+      id: util.uuid(),
+      min_version: draftVersion,
+      min_features: ["AIGC_Video_UnifiedEdit"],
+      is_from_tsn: true,
+      version: draftVersion,
+      main_component_id: componentId,
+      component_list: [{
+        type: "video_base_component",
+        id: componentId,
+        min_version: "1.0.0",
+        aigc_mode: "workbench",
+        metadata: {
+          type: "",
+          id: util.uuid(),
+          created_platform: 3,
+          created_platform_version: "",
+          created_time_in_ms: String(Date.now()),
+          created_did: ""
+        },
+        generate_type: "gen_video",
+        abilities: {
+          type: "",
+          id: util.uuid(),
+          gen_video: {
+            type: "",
+            id: util.uuid(),
+            text_to_video_params: {
+              type: "",
+              id: util.uuid(),
+              video_gen_inputs: [{
+                type: "",
+                id: util.uuid(),
+                min_version: draftVersion,
+                prompt: "",
+                video_mode: 2,
+                fps: 24,
+                duration_ms: actualDuration * 1000,
+                idip_meta_list: [],
+                unified_edit_input: {
+                  type: "",
+                  id: util.uuid(),
+                  material_list: materialList,
+                  meta_list: metaList
+                }
+              }],
+              video_aspect_ratio: aspectRatio,
+              seed: Math.floor(Math.random() * 1000000000),
+              model_req_key: model,
+              priority: 0
+            },
+            video_task_extra: metricsExtra
+          }
+        },
+        process_type: 1
+      }]
+    }),
+    http_common_info: {
+      aid: CORE_ASSISTANT_ID,
+    },
+  };
+
+  const generateResult = await browserService.fetch(
+    token,
+    generateUrl,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(generateBody),
+    }
+  );
+
+  const { ret, errmsg, data: generateData } = generateResult;
+  if (ret !== undefined && Number(ret) !== 0) {
+    if (Number(ret) === 5000) {
+      throw new APIException(EX.API_IMAGE_GENERATION_INSUFFICIENT_POINTS, `[无法生成视频]: 即梦积分可能不足，${errmsg}`);
+    }
+    throw new APIException(EX.API_REQUEST_FAILED, `[请求jimeng失败]: ${errmsg}`);
+  }
+
+  const aigcData = generateData?.aigc_data || generateResult.aigc_data;
+  const historyId = aigcData?.history_record_id;
+  if (!historyId) {
+    throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "记录ID不存在");
+  }
+
+  return {
+    history_record_id: String(historyId),
+    status: 20,
+  };
+}
+
+function asObject(value: any): Record<string, any> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return value as Record<string, any>;
+}
+
+function toNumber(value: any): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function extractQueueInfo(historyData: any): { queue_position?: number; queue_total?: number; queue_eta?: string } {
+  const queueCandidates = [
+    asObject(historyData?.queue_info),
+    asObject(historyData?.task?.queue_info),
+    asObject(historyData?.queue),
+    asObject(historyData?.task?.queue),
+  ];
+
+  for (const queue of queueCandidates) {
+    if (Object.keys(queue).length === 0) {
+      continue;
+    }
+
+    const queuePosition =
+      toNumber(queue.queue_position) ??
+      toNumber(queue.position) ??
+      toNumber(queue.current_position) ??
+      toNumber(queue.current) ??
+      toNumber(queue.rank);
+
+    const queueTotal =
+      toNumber(queue.queue_total) ??
+      toNumber(queue.total) ??
+      toNumber(queue.total_count) ??
+      toNumber(queue.max);
+
+    const queueEta =
+      (typeof queue.queue_eta === "string" && queue.queue_eta) ||
+      (typeof queue.eta === "string" && queue.eta) ||
+      (typeof queue.remain_time === "string" && queue.remain_time) ||
+      (typeof queue.remain_time_desc === "string" && queue.remain_time_desc) ||
+      undefined;
+
+    if (queuePosition !== undefined || queueTotal !== undefined || queueEta) {
+      return {
+        queue_position: queuePosition,
+        queue_total: queueTotal,
+        queue_eta: queueEta,
+      };
+    }
+  }
+
+  return {
+    queue_position: toNumber(historyData?.queue_position),
+    queue_total: toNumber(historyData?.queue_total),
+    queue_eta: typeof historyData?.queue_eta === "string" ? historyData.queue_eta : undefined,
+  };
+}
+
+function getHistoryDataById(result: any, historyRecordId: string): any {
+  if (!result) {
+    return null;
+  }
+  if (result.history_list?.length) {
+    return result.history_list[0];
+  }
+  if (result.history_records?.length) {
+    return result.history_records[0];
+  }
+  if (result[historyRecordId]) {
+    return result[historyRecordId];
+  }
+  if (result.data && result.data[historyRecordId]) {
+    return result.data[historyRecordId];
+  }
+  return null;
+}
+
+function extractItemId(itemList: any[]): string | undefined {
+  const first = itemList?.[0];
+  if (!first) {
+    return undefined;
+  }
+  return String(first.item_id || first.id || first.local_item_id || first.common_attr?.id || "") || undefined;
+}
+
+function extractVideoUrl(itemList: any[]): string | undefined {
+  const first = itemList?.[0];
+  if (!first) {
+    return undefined;
+  }
+
+  return (
+    first.video?.transcoded_video?.origin?.video_url ||
+    first.video?.play_url ||
+    first.video?.download_url ||
+    first.video?.url ||
+    first.url
+  );
+}
+
+/**
+ * 根据 history_record_id 查询一次任务状态（不阻塞轮询）。
+ */
+export async function getVideoStatusByHistoryId(historyRecordId: string, refreshToken: string) {
+  const result = await request("post", "/mweb/v1/get_history_by_ids", refreshToken, {
+    data: {
+      history_ids: [historyRecordId],
+    },
+  });
+
+  const historyData = getHistoryDataById(result, historyRecordId);
+  if (!historyData) {
+    throw new APIException(EX.API_IMAGE_GENERATION_FAILED, `历史记录不存在: ${historyRecordId}`);
+  }
+
+  const status = toNumber(historyData.status) ?? 20;
+  const failCode = historyData.fail_code;
+  const itemList = Array.isArray(historyData.item_list) ? historyData.item_list : [];
+  const queueInfo = extractQueueInfo(historyData);
+  let videoUrl = extractVideoUrl(itemList);
+
+  if (!videoUrl && status !== 20 && status !== 30) {
+    const itemId = extractItemId(itemList);
+    if (itemId) {
+      try {
+        videoUrl = await fetchHighQualityVideoUrl(itemId, refreshToken);
+      } catch (error) {
+        logger.warn(`status 查询中获取高质量视频 URL 失败: ${error.message}`);
+      }
+    }
+  }
+
+  return {
+    history_record_id: String(historyRecordId),
+    status,
+    fail_code: failCode,
+    queue_position: queueInfo.queue_position,
+    queue_total: queueInfo.queue_total,
+    queue_eta: queueInfo.queue_eta,
+    video_url: videoUrl,
+    item_list: itemList,
+    raw: historyData,
+  };
+}
+
+/**
  * 解析 prompt 中的素材占位符并构建 meta_list
  * 支持格式: "使用 @1 图片，@2 图片做动画" -> [text, material(0), text, material(1), text]
  * meta_type 根据素材实际类型动态匹配（image/video/audio）
